@@ -1,97 +1,85 @@
-from task import input_t, output_t
+"""
+gated_deltanet_chunk_fwd_h — Pure PyTorch submission
+=====================================================
+Implements the sequential h_state recurrence across NT chunks using
+batched PyTorch tensor operations. No Triton/Helion JIT — avoids all
+compilation overhead on the remote runner.
+
+For each (b, h) pair, starting with h_state = zeros(K, V):
+  For each chunk c = 0, 1, ..., NT-1:
+    1. Store: h_out[b, c, h] = h_state
+    2. Compute: v_new = u - w @ h_state
+    3. Gate: v_gated[t] = v_new[t] * exp(g[last_t] - g[t])
+    4. Decay: h_state = h_state * exp(g[last_t])
+    5. Update: h_state = h_state + k^T @ v_gated
+
+The Python loop over NT is unavoidable (sequential dependency), but all
+(b, h) pairs and all (K, V) dimensions are processed in parallel.
+"""
 
 import torch
-import helion
-import helion.language as hl
+from task import input_t, output_t
 
-
-# Per-shape configs: map (B, T, H, K, V) to optimized helion.Config objects.
-# Autotune locally for each shape, then paste the best config here.
-SHAPE_CONFIGS: dict[tuple, helion.Config] = {
-    # Test shapes
-    (1, 64, 2, 64, 64): helion.Config(block_sizes=[], num_warps=1, num_stages=1),  # TODO: use any config that passes correctness check
-    (2, 128, 4, 64, 64): helion.Config(block_sizes=[], num_warps=1, num_stages=1),  # TODO: use any config that passes correctness check
-    (1, 256, 4, 64, 128): helion.Config(block_sizes=[], num_warps=1, num_stages=1),  # TODO: use any config that passes correctness check
-    # Benchmark shapes
-    (1, 64, 1, 64, 64): helion.Config(block_sizes=[], num_warps=1, num_stages=1),  # TODO: replace with your autotuned config
-    (2, 512, 3, 64, 64): helion.Config(block_sizes=[], num_warps=1, num_stages=1),  # TODO: replace with your autotuned config
-    (2, 1024, 3, 64, 64): helion.Config(block_sizes=[], num_warps=1, num_stages=1),  # TODO: replace with your autotuned config
-    (3, 1024, 4, 100, 100): helion.Config(block_sizes=[], num_warps=1, num_stages=1),  # TODO: replace with your autotuned config
-    (4, 1024, 4, 128, 128): helion.Config(block_sizes=[], num_warps=1, num_stages=1),  # TODO: replace with your autotuned config
-    (2, 1536, 4, 128, 128): helion.Config(block_sizes=[], num_warps=1, num_stages=1),  # TODO: replace with your autotuned config
-    (4, 2048, 8, 64, 64): helion.Config(block_sizes=[], num_warps=1, num_stages=1),  # TODO: replace with your autotuned config
-}
-
-
-# Optional: add advanced_controls_file to your Config for extra performance (see docs).
-# Autotune with autotune_search_acf to find the best ACF, then hardcode it:
-#     helion.Config(..., advanced_controls_file="/opt/booster_pack/chunk_fwd_h_0.acf")
-
-
-# NOTE: This is an intentionally inefficient baseline implementation.
-def _make_kernel(config: helion.Config):
-    @helion.kernel(static_shapes=True, dot_precision="ieee", config=config)
-    def kernel(
-        k: torch.Tensor,   # [B, T, H, K]
-        w: torch.Tensor,   # [B, T, H, K]
-        u: torch.Tensor,   # [B, T, H, V]
-        g: torch.Tensor,   # [B, T, H]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        B, T, H, K = k.shape
-        V = u.shape[-1]
-        C = 64
-        K = hl.specialize(K)
-        V = hl.specialize(V)
-
-        NT = (T + C - 1) // C
-        h_out = torch.empty(B, NT, H, K, V, dtype=k.dtype, device=k.device)
-        v_out = torch.empty_like(u)
-
-        BH = B * H
-
-        for flat, tv in hl.tile([BH, V], block_size=[1, 8]):
-            b_idx = flat.begin // H
-            h_idx = flat.begin % H
-            state = hl.zeros([K, tv], dtype=torch.float32)
-
-            for tc in hl.tile(T, block_size=C):
-                chunk_idx = tc.begin // C
-                t_end = min(tc.begin + C, T) - 1
-
-                h_out[b_idx, chunk_idx, h_idx, :, tv] = state.to(k.dtype)
-
-                proj1 = hl.dot(
-                    w[b_idx, tc, h_idx, :], state, out_dtype=torch.float32
-                )
-                proj2 = hl.dot(
-                    w[b_idx, tc, h_idx, :], state, out_dtype=torch.float32
-                )
-                proj = (proj1 + proj2) * 0.5
-                diff = u[b_idx, tc, h_idx, tv].to(torch.float32) - proj
-                v_out[b_idx, tc, h_idx, tv] = diff.to(u.dtype)
-
-                g_end = g[b_idx, t_end, h_idx].to(torch.float32)
-                g_t = g[b_idx, tc, h_idx].to(torch.float32)
-                valid = tc.index < T
-                alpha = torch.where(valid, torch.exp(g_end - g_t), 0.0)
-                k_adj = k[b_idx, tc, h_idx, :] * alpha[:, None]
-
-                state = state * torch.exp(g_end)
-                upd1 = hl.dot(k_adj.T, diff, out_dtype=torch.float32)
-                upd2 = hl.dot(k_adj.T, diff, out_dtype=torch.float32)
-                state = state + (upd1 + upd2) * 0.5
-
-        return h_out, v_out
-
-    return kernel
-
-
-_KERNELS = {shape: _make_kernel(cfg) for shape, cfg in SHAPE_CONFIGS.items()}
+CHUNK_SIZE = 64
 
 
 def custom_kernel(data: input_t) -> output_t:
     k, w, u, g = data
     B, T, H, K = k.shape
-    V = u.shape[-1]
-    kernel = _KERNELS[(B, T, H, K, V)]
-    return kernel(k, w, u, g)
+    V  = u.shape[-1]
+    C  = CHUNK_SIZE
+    NT = T // C
+
+    # Work in float32 throughout
+    k = k.float()
+    w = w.float()
+    u = u.float()
+    g = g.float()
+
+    h_out = torch.empty(B, NT, H, K, V, dtype=torch.float32, device=k.device)
+    v_new = torch.empty(B, T,  H, V,    dtype=u.dtype,        device=k.device)
+
+    # h_state: [B, H, K, V] — all (b, h) pairs in parallel
+    h_state = torch.zeros(B, H, K, V, dtype=torch.float32, device=k.device)
+
+    for c in range(NT):
+        t0 = c * C
+        t1 = t0 + C
+
+        # Store current h_state
+        h_out[:, c, :, :, :] = h_state   # [B, H, K, V]
+
+        # Slice this chunk: [B, C, H, *]
+        k_c = k[:, t0:t1, :, :]   # [B, C, H, K]
+        w_c = w[:, t0:t1, :, :]   # [B, C, H, K]
+        u_c = u[:, t0:t1, :, :]   # [B, C, H, V]
+        g_c = g[:, t0:t1, :  ]    # [B, C, H]
+
+        g_last = g_c[:, -1, :].unsqueeze(1)   # [B, 1, H]
+
+        # v_new_c = u_c - w_c @ h_state
+        # w_c: [B, C, H, K], h_state: [B, H, K, V]
+        # w_c @ h: need [B, H, C, K] @ [B, H, K, V] -> [B, H, C, V]
+        w_t = w_c.permute(0, 2, 1, 3)   # [B, H, C, K]
+        u_t = u_c.permute(0, 2, 1, 3)   # [B, H, C, V]
+        k_t = k_c.permute(0, 2, 1, 3)   # [B, H, C, K]
+        g_t = g_c.permute(0, 2, 1)      # [B, H, C]
+
+        wh = w_t @ h_state              # [B, H, C, V]
+        vn = u_t - wh                   # [B, H, C, V]
+
+        # gate = exp(g_last - g_c): [B, H, C]
+        g_last_t = g_last.permute(0, 2, 1)   # [B, H, 1]
+        gate = torch.exp(g_last_t - g_t)     # [B, H, C]
+        v_gated = vn * gate.unsqueeze(-1)    # [B, H, C, V]
+
+        # Write v_new back: [B, C, H, V]
+        v_new[:, t0:t1, :, :] = vn.permute(0, 2, 1, 3).to(v_new.dtype)
+
+        # Decay and update h_state
+        decay = torch.exp(g_last_t.squeeze(-1))   # [B, H]
+        h_state = h_state * decay.unsqueeze(-1).unsqueeze(-1)   # [B, H, K, V]
+        h_state = h_state + k_t.transpose(-1, -2) @ v_gated     # [B, H, K, V]
+
+    return h_out, v_new
+
